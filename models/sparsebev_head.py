@@ -317,7 +317,12 @@ class SparseBEVHead(DETRHead):
         bbox_weights[pos_inds] = 1.0
         
         # DETR
-        bbox_targets[pos_inds] = sampling_result.pos_gt_bboxes
+        try:
+            bbox_targets[pos_inds] = sampling_result.pos_gt_bboxes
+        except:
+            print(pos_inds)
+            print(sampling_result.pos_gt_bboxes)
+            breakpoint()
         return (labels, label_weights, bbox_targets, bbox_weights, pos_inds, neg_inds)
 
     def get_targets(self,
@@ -412,6 +417,11 @@ class SparseBEVHead(DETRHead):
 
         num_dec_layers = len(all_cls_scores)
         device = gt_labels_list[0].device
+        
+        
+        for box_list in gt_bboxes_list:
+            assert len(box_list) > 0, breakpoint()
+     
         gt_bboxes_list = [torch.cat(
             (gt_bboxes.gravity_center, gt_bboxes.tensor[:, 3:]),
             dim=1).to(device) for gt_bboxes in gt_bboxes_list]

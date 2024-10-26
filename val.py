@@ -15,14 +15,43 @@ from mmdet3d.datasets import build_dataset, build_dataloader
 from mmdet3d.models import build_model
 
 
-def evaluate(dataset, results):
-    metrics = dataset.evaluate(results, jsonfile_prefix=None)
+def evaluate_occ(dataset, results):
+    metrics = dataset.evaluate_occ(results, jsonfile_prefix=None)
 
     logging.info('--- Evaluation Results ---')
     for k, v in metrics.items():
         logging.info('%s: %.4f' % (k, v))
 
     return metrics
+
+def evaluate_det(dataset, results):     
+    metrics = dataset.evaluate(results, jsonfile_prefix='submission')
+
+    mAP = metrics['pts_bbox_NuScenes/mAP']
+    mATE = metrics['pts_bbox_NuScenes/mATE']
+    mASE = metrics['pts_bbox_NuScenes/mASE']
+    mAOE = metrics['pts_bbox_NuScenes/mAOE']
+    mAVE = metrics['pts_bbox_NuScenes/mAVE']
+    mAAE = metrics['pts_bbox_NuScenes/mAAE']
+    NDS = metrics['pts_bbox_NuScenes/NDS']
+
+    logging.info('mAP: %.4f' % metrics['pts_bbox_NuScenes/mAP'])
+    logging.info('mATE: %.4f' % metrics['pts_bbox_NuScenes/mATE'])
+    logging.info('mASE: %.4f' % metrics['pts_bbox_NuScenes/mASE'])
+    logging.info('mAOE: %.4f' % metrics['pts_bbox_NuScenes/mAOE'])
+    logging.info('mAVE: %.4f' % metrics['pts_bbox_NuScenes/mAVE'])
+    logging.info('mAAE: %.4f' % metrics['pts_bbox_NuScenes/mAAE'])
+    logging.info('NDS: %.4f' % metrics['pts_bbox_NuScenes/NDS'])
+
+    return {
+        'mAP': mAP,
+        'mATE': mATE,
+        'mASE': mASE,
+        'mAOE': mAOE,
+        'mAVE': mAVE,
+        'mAAE': mAAE,
+        'NDS': NDS,
+    }
 
 
 def main():
@@ -98,6 +127,7 @@ def main():
 
     if os.path.isfile(args.weights):
         logging.info('Loading checkpoint from %s' % args.weights)
+        
         load_checkpoint(
             model, args.weights, map_location='cuda', strict=True,
             logger=logging.Logger(__name__, logging.ERROR)
@@ -107,9 +137,10 @@ def main():
         results = multi_gpu_test(model, val_loader, gpu_collect=True)
     else:
         results = single_gpu_test(model, val_loader)
-
+    
     if local_rank == 0:
-        evaluate(val_dataset, results)
+        evaluate_occ(val_dataset, results)
+        evaluate_det(val_dataset, results)
 
 
 if __name__ == '__main__':

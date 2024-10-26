@@ -18,7 +18,7 @@ from configs.r50_nuimg_704x256_8f_openocc import occ_class_names as openocc_clas
 @DATASETS.register_module()
 class NuSceneOcc(NuScenesDataset):    
     def __init__(self, occ_gt_root, *args, **kwargs):
-        super().__init__(filter_empty_gt=False, *args, **kwargs)
+        super().__init__(filter_empty_gt=True, *args, **kwargs) # change filter_empty_gt
         self.occ_gt_root = occ_gt_root
         self.data_infos = self.load_annotations(self.ann_file)
 
@@ -108,14 +108,14 @@ class NuSceneOcc(NuScenesDataset):
                 img_timestamp=img_timestamps,
                 lidar2img=lidar2img_rts,
             ))
-
+            
         if not self.test_mode:
             annos = self.get_ann_info(index)
             input_dict['ann_info'] = annos
 
         return input_dict
 
-    def evaluate(self, occ_results, runner=None, show_dir=None, **eval_kwargs):
+    def evaluate_occ(self, occ_results, runner=None, show_dir=None, **eval_kwargs):
         occ_gts, occ_preds, inst_gts, inst_preds, lidar_origins = [], [], [], [], []
         print('\nStarting Evaluation...')
 
@@ -174,7 +174,7 @@ class NuSceneOcc(NuScenesDataset):
         else:
             return main_rayiou(occ_preds, occ_gts, lidar_origins, occ_class_names=occ_class_names)
 
-    def format_results(self, occ_results, submission_prefix, **kwargs):
+    def format_occ_results(self, occ_results, submission_prefix, **kwargs):
         if submission_prefix is not None:
             mmcv.mkdir_or_exist(submission_prefix)
 
@@ -185,3 +185,95 @@ class NuSceneOcc(NuScenesDataset):
             np.savez_compressed(save_path, occ_pred.astype(np.uint8))
         
         print('\nFinished.')
+    
+    def get_det_results(self, results):
+        det_results = [dict() for _ in range(len(results))]
+        for i, result in enumerate(results):
+            det_results[i]['pts_bbox'] = result['pts_bbox'][0]
+        return det_results # [{'pts_bbox': {'boxes_3d'：..., 'scores_3d': ..., 'labels_3d': ...}, ...}]
+    
+    def format_results(self, results, jsonfile_prefix=None):
+        import tempfile
+        from os import path as osp
+        results = self.get_det_results(results)
+        assert isinstance(results, list), 'results must be a list'
+        assert len(results) == len(self), (
+            'The length of results is not equal to the dataset len: {} != {}'.
+            format(len(results), len(self)))
+
+        if jsonfile_prefix is None:
+            tmp_dir = tempfile.TemporaryDirectory()
+            jsonfile_prefix = osp.join(tmp_dir.name, 'results')
+        else:
+            tmp_dir = None
+
+        # currently the output prediction results could be in two formats
+        # 1. list of dict('boxes_3d': ..., 'scores_3d': ..., 'labels_3d': ...)
+        # 2. list of dict('pts_bbox' or 'img_bbox':
+        #     dict('boxes_3d': ..., 'scores_3d': ..., 'labels_3d': ...))
+        # this is a workaround to enable evaluation of both formats on nuScenes
+        # refer to https://github.com/open-mmlab/mmdetection3d/issues/449
+        if not ('pts_bbox' in results[0] or 'img_bbox' in results[0]):
+            result_files = self._format_bbox(results, jsonfile_prefix)
+        else:
+            # should take the inner dict out of 'pts_bbox' or 'img_bbox' dict
+            result_files = dict()
+            for name in results[0]:
+                print(f'\nFormating bboxes of {name}')
+                results_ = [out[name] for out in results]
+                tmp_file_ = osp.join(jsonfile_prefix, name)
+                result_files.update(
+                    {name: self._format_bbox(results_, tmp_file_)})
+        return result_files, tmp_dir
+        
+        
+    def evaluate(self,
+                results,
+                metric='bbox',
+                logger=None,
+                jsonfile_prefix=None,
+                result_names=['pts_bbox'],
+                show=False,
+                out_dir=None,
+                pipeline=None):
+            """Evaluation in nuScenes protocol.
+
+            Args:
+                results (list[dict]): Testing results of the dataset.
+                metric (str | list[str], optional): Metrics to be evaluated.
+                    Default: 'bbox'.
+                logger (logging.Logger | str, optional): Logger used for printing
+                    related information during evaluation. Default: None.
+                jsonfile_prefix (str, optional): The prefix of json files including
+                    the file path and the prefix of filename, e.g., "a/b/prefix".
+                    If not specified, a temp file will be created. Default: None.
+                show (bool, optional): Whether to visualize.
+                    Default: False.
+                out_dir (str, optional): Path to save the visualization results.
+                    Default: None.
+                pipeline (list[dict], optional): raw data loading for showing.
+                    Default: None.
+
+            Returns:
+                dict[str, float]: Results of each evaluation metric.
+            """
+            print('Evaluating occupancy prediction results ...')
+            self.evaluate_occ(results, runner=None, show_dir=None)
+            
+            result_files, tmp_dir = self.format_results(results, jsonfile_prefix)
+
+            if isinstance(result_files, dict):
+                results_dict = dict()
+                for name in result_names:
+                    print('Evaluating bboxes of {}'.format(name))
+                    ret_dict = self._evaluate_single(result_files[name])
+                results_dict.update(ret_dict)
+            elif isinstance(result_files, str):
+                results_dict = self._evaluate_single(result_files)
+
+            if tmp_dir is not None:
+                tmp_dir.cleanup()
+
+            if show or out_dir:
+                self.show(results, out_dir, show=show, pipeline=pipeline)
+            return results_dict

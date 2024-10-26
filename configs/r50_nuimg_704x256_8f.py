@@ -6,6 +6,7 @@ occ_gt_root = 'data/nuscenes/occ3d'
 # cloud range accordingly
 point_cloud_range = [-40, -40, -1.0, 40, 40, 5.4]
 occ_size = [200, 200, 16]
+voxel_size = [0.2, 0.2, 6.4]
 
 img_norm_cfg = dict(
     mean=[123.675, 116.280, 103.530],
@@ -34,6 +35,7 @@ input_modality = dict(
     use_external=False
 )
 
+# occ arch config
 _dim_ = 256
 _num_points_ = 4
 _num_groups_ = 4
@@ -43,6 +45,14 @@ _num_queries_ = 100
 _topk_training_ = [4000, 16000, 64000]
 _topk_testing_ = [2000, 8000, 32000]
 
+# det arch config
+embed_dims = 256
+num_layers = 6
+num_query = 900
+num_frames = 8
+num_levels = 4
+num_points = 4
+
 model = dict(
     type='SparseOcc',
     data_aug=dict(
@@ -50,6 +60,7 @@ model = dict(
         img_norm_cfg=img_norm_cfg,
         img_pad_cfg=dict(size_divisor=32)),
     use_mask_camera=False,
+    stop_prev_grad=0,
     img_backbone=dict(
         type='ResNet',
         depth=50,
@@ -66,6 +77,47 @@ model = dict(
         out_channels=_dim_,
         num_outs=4),
     pts_bbox_head=dict(
+        type='SparseBEVHead',
+        num_classes=10,
+        in_channels=embed_dims,
+        num_query=num_query,
+        query_denoising=True,
+        query_denoising_groups=10,
+        code_size=10,
+        code_weights=[2.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        sync_cls_avg_factor=True,
+        transformer=dict(
+            type='SparseBEVTransformer',
+            embed_dims=embed_dims,
+            num_frames=num_frames,
+            num_points=num_points,
+            num_layers=num_layers,
+            num_levels=num_levels,
+            num_classes=10,
+            code_size=10,
+            pc_range=point_cloud_range),
+        bbox_coder=dict(
+            type='NMSFreeCoder',
+            post_center_range=[-61.2, -61.2, -10.0, 61.2, 61.2, 10.0],
+            pc_range=point_cloud_range,
+            max_num=300,
+            voxel_size=voxel_size,
+            score_threshold=0.05,
+            num_classes=10),
+        positional_encoding=dict(
+            type='SinePositionalEncoding',
+            num_feats=embed_dims // 2,
+            normalize=True,
+            offset=-0.5),
+        loss_cls=dict(
+            type='FocalLoss',
+            use_sigmoid=True,
+            gamma=2.0,
+            alpha=0.25,
+            loss_weight=2.0),
+        loss_bbox=dict(type='L1Loss', loss_weight=0.25),
+        loss_iou=dict(type='GIoULoss', loss_weight=0.0)),
+    pts_occ_head=dict(
         type='SparseOccHead',
         class_names=occ_class_names,
         embed_dims=_dim_,
@@ -106,6 +158,18 @@ model = dict(
             )
         ),
     ),
+    train_cfg=dict(pts=dict(
+        grid_size=[400, 400, 1],
+        voxel_size=voxel_size,
+        point_cloud_range=point_cloud_range,
+        out_size_factor=4,
+        assigner=dict(
+            type='HungarianAssigner3D',
+            cls_cost=dict(type='FocalLossCost', weight=2.0),
+            reg_cost=dict(type='BBox3DL1Cost', weight=0.25),
+            iou_cost=dict(type='IoUCost', weight=0.0),
+        )
+    ))
 )
 
 ida_aug_conf = {
@@ -129,21 +193,28 @@ train_pipeline = [
     dict(type='LoadMultiViewImageFromMultiSweeps', sweeps_num=_num_frames_ - 1),
     dict(type='BEVAug', bda_aug_conf=bda_aug_conf, classes=det_class_names, is_train=True),
     dict(type='LoadOccGTFromFile', num_classes=len(occ_class_names)),
+    dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True, with_attr_label=False),
+    dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
+    dict(type='ObjectNameFilter', classes=det_class_names),
     dict(type='RandomTransformImage', ida_aug_conf=ida_aug_conf, training=True),
+    dict(type='GlobalRotScaleTransImage', rot_range=[-0.3925, 0.3925], scale_ratio_range=[0.95, 1.05]),
     dict(type='DefaultFormatBundle3D', class_names=det_class_names),
-    dict(type='Collect3D', keys=['img', 'voxel_semantics', 'voxel_instances', 'instance_class_ids'],  # other keys: 'mask_camera'
+    dict(type='Collect3D', keys=['img', 'gt_bboxes_3d', 'gt_labels_3d', 'voxel_semantics', 'voxel_instances', 'instance_class_ids'],  # other keys: 'mask_camera'
          meta_keys=('filename', 'ori_shape', 'img_shape', 'pad_shape', 'lidar2img', 'img_timestamp', 'ego2lidar'))
 ]
 
 test_pipeline = [
     dict(type='LoadMultiViewImageFromFiles', to_float32=False, color_type='color'),
     dict(type='LoadMultiViewImageFromMultiSweeps', sweeps_num=_num_frames_ - 1, test_mode=True),
+    dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True, with_attr_label=False),
+    dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
+    dict(type='ObjectNameFilter', classes=det_class_names),
     dict(type='BEVAug', bda_aug_conf=bda_aug_conf, classes=det_class_names, is_train=False),
     dict(type='LoadOccGTFromFile', num_classes=len(occ_class_names)),
     dict(type='RandomTransformImage', ida_aug_conf=ida_aug_conf, training=False),
     dict(type='DefaultFormatBundle3D', class_names=det_class_names),
-    dict(type='Collect3D', keys=['img', 'voxel_semantics', 'voxel_instances', 'instance_class_ids'],
-         meta_keys=('filename', 'ori_shape', 'img_shape', 'pad_shape', 'lidar2img', 'img_timestamp', 'ego2lidar'))
+    dict(type='Collect3D', keys=['img', 'gt_bboxes_3d', 'gt_labels_3d', 'voxel_semantics', 'voxel_instances', 'instance_class_ids'],
+         meta_keys=('filename', 'box_type_3d', 'ori_shape', 'img_shape', 'pad_shape', 'lidar2img', 'img_timestamp', 'ego2lidar'))
 ]
 
 data = dict(
@@ -156,17 +227,19 @@ data = dict(
         pipeline=train_pipeline,
         classes=det_class_names,
         modality=input_modality,
-        test_mode=False
+        test_mode=False,
+        use_valid_flag=True,
+        box_type_3d='LiDAR'
     ),
     val=dict(
         type=dataset_type,
         data_root=dataset_root,
         occ_gt_root=occ_gt_root,
-        ann_file=dataset_root + 'nuscenes_infos_val_sweep.pkl',
+        ann_file=dataset_root + 'nuscenes_infos_val_mini_sweep.pkl',
         pipeline=test_pipeline,
         classes=det_class_names,
         modality=input_modality,
-        test_mode=True
+        test_mode=False
     ),
     test=dict(
         type=dataset_type,
@@ -176,7 +249,8 @@ data = dict(
         pipeline=test_pipeline,
         classes=det_class_names,
         modality=input_modality,
-        test_mode=True
+        test_mode=True,
+        box_type_3d='LiDAR'
     ),
 )
 
@@ -190,7 +264,11 @@ optimizer = dict(
         }),
     weight_decay=0.01
 )
-optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
+optimizer_config = dict(
+    type='Fp16OptimizerHook',
+    loss_scale=512.0,
+    grad_clip=dict(max_norm=35, norm_type=2)
+)
 
 lr_config = dict(
     policy='step',
@@ -201,18 +279,19 @@ lr_config = dict(
     step=[22, 24],
     gamma=0.2
 )
+
 total_epochs = 24
-batch_size = 8
+batch_size = 16
 
 # load pretrained weights
-load_from = 'pretrain/cascade_mask_rcnn_r50_fpn_coco-20e_20e_nuim_20201009_124951-40963960.pth'
-revise_keys = [('backbone', 'img_backbone')]
+load_from = './bev_occ_model.pth' # '../SparseBEV/ckpts/r50_nuimg_704x256.pth'
+revise_keys = None # [('backbone', 'img_backbone')]
 
 # resume the last training
 resume_from = None
 
-# checkpointing
-checkpoint_config = dict(interval=1, max_keep_ckpts=1)
+# checkpointing: save model per interval, and the max number of models to be saved
+checkpoint_config = dict(interval=1, max_keep_ckpts=total_epochs)
 
 # logging
 log_config = dict(
@@ -223,8 +302,10 @@ log_config = dict(
     ]
 )
 
-# evaluation
-eval_config = dict(interval=total_epochs)
+eval_interval = 0
+
+# evaluation: train eval_interval times then eval model
+eval_config = dict(interval=eval_interval, pipeline=test_pipeline)
 
 # other flags
 debug = False

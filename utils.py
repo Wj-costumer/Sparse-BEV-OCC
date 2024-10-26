@@ -8,6 +8,7 @@ import datetime
 import socket
 import wandb
 from mmcv.runner.hooks import HOOKS
+from mmcv.runner import Hook
 from mmcv.runner.hooks.logger import LoggerHook, TextLoggerHook
 from mmcv.runner.dist_utils import master_only
 from torch.utils.tensorboard import SummaryWriter
@@ -59,8 +60,13 @@ class MyTextLoggerHook(TextLoggerHook):
                         f'[{log_dict["iter"]}/{len(runner.data_loader)}] '
         else:
             log_str = f'Iter [{log_dict["iter"]}/{runner.max_iters}] '
+        log_str += 'total loss: %.2f, \n' % log_dict['loss']
+        
+        log_str += 'bbox loss: %.2f, ' % log_dict['loss_bbox']
+        log_str += ' loss_sem_lovasz_0: %.2f, ' % log_dict['loss_sem_lovasz_0']
+        
+        log_str += 'total loss: %.2f, \n' % log_dict['loss']
 
-        log_str += 'loss: %.2f, ' % log_dict['loss']
 
         if 'time' in log_dict.keys():
             # MOD: skip the first iteration since it's not accurate
@@ -125,8 +131,14 @@ class MyTextLoggerHook(TextLoggerHook):
         if runner.log_buffer.ready:
             metrics = self.get_loggable_tags(runner)
             runner.logger.info('--- Evaluation Results ---')
-            runner.logger.info('RayIoU: %.4f' % metrics['val/RayIoU'])
-
+            # runner.logger.info('RayIoU: %.4f' % metrics['val/RayIoU'])
+            runner.logger.info('mAP: %.4f' % metrics['val/pts_bbox_NuScenes/mAP'])
+            runner.logger.info('mATE: %.4f' % metrics['val/pts_bbox_NuScenes/mATE'])
+            runner.logger.info('mASE: %.4f' % metrics['val/pts_bbox_NuScenes/mASE'])
+            runner.logger.info('mAOE: %.4f' % metrics['val/pts_bbox_NuScenes/mAOE'])
+            runner.logger.info('mAVE: %.4f' % metrics['val/pts_bbox_NuScenes/mAVE'])
+            runner.logger.info('mAAE: %.4f' % metrics['val/pts_bbox_NuScenes/mAAE'])
+            runner.logger.info('NDS: %.4f' % metrics['val/pts_bbox_NuScenes/NDS'])
 
 @HOOKS.register_module()
 class MyTensorboardLoggerHook(LoggerHook):
@@ -295,3 +307,33 @@ class MyWandbLoggerHook(LoggerHook):
     @master_only
     def after_run(self, runner) -> None:
         self.wandb.join()
+
+@HOOKS.register_module()
+class CustomEvaluateHook(Hook):
+    def __init__(self, metric='bbox', **kwargs):
+        self.metric = metric
+        super().__init__()
+
+    def after_train_epoch(self, runner):
+        # 获取当前模型的预测结果
+        results = runner.model.predict()  # 根据实际情况修改此行
+        
+        # 计算评价指标
+        metrics = self.evaluate(results)
+
+        # 将评价指标记录到 log_buffer
+        for key, value in metrics.items():
+            runner.log_buffer.output[key] = value
+
+        # 打印日志
+        runner.log_buffer.output['epoch'] = runner.epoch
+        runner.log_buffer.output['iter'] = runner.iter
+        runner.log_buffer.ready = True
+
+    def evaluate(self, results):
+        # 在这里实现你的评估逻辑，根据需要返回字典格式的指标
+        # 以下是一个示例
+        return {
+            'mAP': 0.85,  # 示例值
+            'IoU': 0.75,  # 示例值
+        }

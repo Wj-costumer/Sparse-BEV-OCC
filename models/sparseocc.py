@@ -5,9 +5,11 @@ from mmcv.runner import get_dist_info
 from mmcv.runner.fp16_utils import cast_tensor_type
 from mmcv.runner import force_fp32, auto_fp16
 from mmdet.models import DETECTORS
+from mmdet3d.core import bbox3d2result
 from mmdet3d.models.detectors.mvx_two_stage import MVXTwoStageDetector
-from .utils import pad_multiple, GpuPhotoMetricDistortion
-
+from .utils import pad_multiple, GpuPhotoMetricDistortion, GridMask
+from mmdet3d.models import builder
+import copy
 
 @DETECTORS.register_module()
 class SparseOcc(MVXTwoStageDetector):
@@ -21,12 +23,14 @@ class SparseOcc(MVXTwoStageDetector):
                  img_neck=None,
                  pts_neck=None,
                  pts_bbox_head=None,
+                 pts_occ_head=None,
                  img_roi_head=None,
                  img_rpn_head=None,
                  train_cfg=None,
                  test_cfg=None,
                  pretrained=None,
                  data_aug=None,
+                 stop_prev_grad=None,
                  use_mask_camera=False,
                  **kwargs):
 
@@ -39,13 +43,26 @@ class SparseOcc(MVXTwoStageDetector):
         self.use_mask_camera = use_mask_camera
         self.fp16_enabled = False
         self.data_aug = data_aug
+        self.stop_prev_grad = stop_prev_grad
         self.color_aug = GpuPhotoMetricDistortion()
-
+        self.grid_mask = GridMask(ratio=0.5, prob=0.7)
+        self.use_grid_mask = True
         self.memory = {}
         self.queue = queue.Queue()
 
+        self.pts_occ_head = builder.build_head(pts_occ_head)
+        
+        # freeze occ head model parameters
+        for name, param in self.named_parameters():
+            if ("img" in name) or ("occ" in name):
+                param.requires_grad = False
+
+        
     @auto_fp16(apply_to=('img'), out_fp32=True)
     def extract_img_feat(self, img):
+        if self.use_grid_mask:
+            img = self.grid_mask(img)
+            
         img_feats = self.img_backbone(img)
 
         if isinstance(img_feats, dict):
@@ -106,15 +123,32 @@ class SparseOcc(MVXTwoStageDetector):
 
         return img_feats_reshaped
 
-    def forward_pts_train(self, mlvl_feats, voxel_semantics, voxel_instances, instance_class_ids, mask_camera, img_metas):
+    def forward_pts_train(self, 
+                          mlvl_feats, 
+                          gt_bboxes_3d,
+                          gt_labels_3d,
+                          voxel_semantics, 
+                          voxel_instances, 
+                          instance_class_ids,
+                          mask_camera, 
+                          img_metas):
         """
         voxel_semantics: [bs, 200, 200, 16], value in range [0, num_cls - 1]
         voxel_instances: [bs, 200, 200, 16], value in range [0, num_obj - 1]
         instance_class_ids: [[bs0_num_obj], [bs1_num_obj], ...], value in range [0, num_cls - 1]
         """
-        outs = self.pts_bbox_head(mlvl_feats, img_metas)
-        loss_inputs = [voxel_semantics, voxel_instances, instance_class_ids, outs]
-        return self.pts_bbox_head.loss(*loss_inputs)
+        mlvl_feats_copy = [copy.deepcopy(mlvl_feats[i].detach()) for i in range(len(mlvl_feats))]
+        img_metas_copy = copy.deepcopy(img_metas)
+      
+        occ_outs = self.pts_occ_head(mlvl_feats, img_metas)
+        det_outs = self.pts_bbox_head(mlvl_feats_copy, img_metas_copy)
+        det_loss_inputs = [gt_bboxes_3d, gt_labels_3d, det_outs]
+        occ_loss_inputs = [voxel_semantics, voxel_instances, instance_class_ids, occ_outs]
+        det_loss = self.pts_bbox_head.loss(*det_loss_inputs)
+        occ_loss = self.pts_occ_head.loss(*occ_loss_inputs)
+        det_loss.update(occ_loss)
+        loss_dict = det_loss
+        return loss_dict
 
     def forward(self, return_loss=True, **kwargs):
         if return_loss:
@@ -123,39 +157,68 @@ class SparseOcc(MVXTwoStageDetector):
             return self.forward_test(**kwargs)
 
     @force_fp32(apply_to=('img'))
-    def forward_train(self, img_metas=None, img=None, voxel_semantics=None, voxel_instances=None, instance_class_ids=None, mask_camera=None, **kwargs):
+    def forward_train(self, 
+                      img_metas=None, 
+                      img=None,
+                      gt_bboxes_3d=None,
+                      gt_labels_3d=None, 
+                      voxel_semantics=None, 
+                      voxel_instances=None, 
+                      instance_class_ids=None, 
+                      mask_camera=None, 
+                      **kwargs):
         img_feats = self.extract_feat(img=img, img_metas=img_metas)
-        return self.forward_pts_train(img_feats, voxel_semantics, voxel_instances, instance_class_ids, mask_camera, img_metas)
+
+        for i in range(len(img_metas)):
+            img_metas[i]['gt_bboxes_3d'] = gt_bboxes_3d[i]
+            img_metas[i]['gt_labels_3d'] = gt_labels_3d[i]
+
+        return self.forward_pts_train(img_feats, gt_bboxes_3d, gt_labels_3d, voxel_semantics, voxel_instances, instance_class_ids, mask_camera, img_metas)
 
     def forward_test(self, img_metas, img=None, **kwargs):
-        output = self.simple_test(img_metas, img)
+        bbox_output, occ_output = self.simple_test(img_metas, img)
 
-        sem_pred = output['sem_pred'].cpu().numpy().astype(np.uint8)
-        occ_loc = output['occ_loc'].cpu().numpy().astype(np.uint8)
+        sem_pred = occ_output['sem_pred'].cpu().numpy().astype(np.uint8)
+        occ_loc = occ_output['occ_loc'].cpu().numpy().astype(np.uint8)
 
         batch_size = sem_pred.shape[0]
 
-        if 'pano_inst' and 'pano_sem' in output:
+        if 'pano_inst' and 'pano_sem' in occ_output:
             # important: uint8 is not enough for pano_pred
-            pano_inst = output['pano_inst'].cpu().numpy().astype(np.int16)
-            pano_sem = output['pano_sem'].cpu().numpy().astype(np.uint8)
+            pano_inst = occ_output['pano_inst'].cpu().numpy().astype(np.int16)
+            pano_sem = occ_output['pano_sem'].cpu().numpy().astype(np.uint8)
+            outputs = [{
+                    'sem_pred': sem_pred[b:b+1],
+                    'pano_inst': pano_inst[b:b+1],
+                    'pano_sem': pano_sem[b:b+1],
+                    'occ_loc': occ_loc[b:b+1],
+                    'pts_bbox': bbox_output[b:b+1]
+                } for b in range(batch_size)]
             
-            return [{
-                'sem_pred': sem_pred[b:b+1],
-                'pano_inst': pano_inst[b:b+1],
-                'pano_sem': pano_sem[b:b+1],
-                'occ_loc': occ_loc[b:b+1]
-            } for b in range(batch_size)]
+            return outputs
         else:
-            return [{
+            outputs = [{
                 'sem_pred': sem_pred[b:b+1],
-                'occ_loc': occ_loc[b:b+1]
+                'occ_loc': occ_loc[b:b+1],
+                'pts_bbox': bbox_output[b:b+1]
             } for b in range(batch_size)]
+        return outputs
 
     def simple_test_pts(self, x, img_metas, rescale=False):
-        outs = self.pts_bbox_head(x, img_metas)
-        outs = self.pts_bbox_head.merge_occ_pred(outs)
-        return outs
+        # x and img_metas have been changed in occ module or det module
+        img_metas_copy = copy.deepcopy(img_metas)
+        x_copy = copy.deepcopy(x)
+        occ_outs = self.pts_occ_head(x, img_metas)
+        det_outs = self.pts_bbox_head(x_copy, img_metas_copy)
+        bbox_list = self.pts_bbox_head.get_bboxes(det_outs, img_metas_copy[0], rescale=rescale)
+
+        bbox_results = [
+            bbox3d2result(bboxes, scores, labels)
+            for bboxes, scores, labels in bbox_list
+        ]
+        
+        occ_results = self.pts_occ_head.merge_occ_pred(occ_outs)
+        return bbox_results, occ_results
 
     def simple_test(self, img_metas, img=None, rescale=False):
         world_size = get_dist_info()[1]
@@ -166,16 +229,23 @@ class SparseOcc(MVXTwoStageDetector):
 
     def simple_test_offline(self, img_metas, img=None, rescale=False):
         img_feats = self.extract_feat(img=img, img_metas=img_metas)
-        return self.simple_test_pts(img_feats, img_metas, rescale=rescale)
+        
+        # bbox_list = [dict() for _ in range(len(img_metas))]
+        bbox_results, occ_results = self.simple_test_pts(img_feats, img_metas, rescale=rescale)
+        return bbox_results, occ_results
 
     def simple_test_online(self, img_metas, img=None, rescale=False):
+
         self.fp16_enabled = False
         assert len(img_metas) == 1  # batch_size = 1
-
+        
         B, N, C, H, W = img.shape
+        
         img = img.reshape(B, N//6, 6, C, H, W)
 
         img_filenames = img_metas[0]['filename']
+        img = img.repeat(1, 8, 1, 1, 1, 1)    
+        
         num_frames = len(img_filenames) // 6
         # assert num_frames == img.shape[1]
 
@@ -199,8 +269,11 @@ class SparseOcc(MVXTwoStageDetector):
                 # found in memory
                 img_feats_curr = self.memory[img_filenames[img_indices[0]]]
             else:
-                # extract feature and put into memory
-                img_feats_curr = self.extract_feat(img[:, i], img_metas_curr)
+                try:
+                    img_feats_curr = self.extract_feat(img[:, i], img_metas_curr)
+                    # breakpoint()
+                except:
+                    breakpoint()
                 self.memory[img_filenames[img_indices[0]]] = img_feats_curr
                 self.queue.put(img_filenames[img_indices[0]])
                 while self.queue.qsize() > 16:  # avoid OOM
@@ -229,4 +302,6 @@ class SparseOcc(MVXTwoStageDetector):
         img_feats = cast_tensor_type(img_feats, torch.half, torch.float32)
 
         # run detector
-        return self.simple_test_pts(img_feats, img_metas, rescale=rescale)
+        bbox_results, occ_results = self.simple_test_pts(img_feats, img_metas, rescale=rescale)
+
+        return bbox_results, occ_results

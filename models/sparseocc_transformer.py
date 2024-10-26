@@ -77,7 +77,7 @@ class SparseOccTransformer(BaseModule):
         
         img_metas = copy.deepcopy(img_metas)
         img_metas[0]['lidar2img'] = torch.matmul(lidar2img, ego2lidar)
-
+        
         occ_preds = self.voxel_decoder(mlvl_feats, img_metas=img_metas)
         mask_preds, class_preds = self.decoder(occ_preds, mlvl_feats, img_metas)
         

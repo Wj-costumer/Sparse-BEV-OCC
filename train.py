@@ -66,7 +66,7 @@ def main():
             if run_name == '':
                 run_name = datetime.now().strftime("%Y-%m-%d/%H-%M-%S")
 
-            work_dir = os.path.join('outputs', cfgs.model.type, run_name)
+            work_dir = os.path.join('/root/autodl-tmp/outputs', cfgs.model.type, run_name)
             if os.path.exists(work_dir):  # must be an empty dir
                 if input('Path "%s" already exists, overwrite it? [Y/n] ' % work_dir) == 'n':
                     print('Bye.')
@@ -84,7 +84,12 @@ def main():
         # disable logging on other workers
         logging.root.disabled = True
         work_dir = '/tmp'
-
+    
+    print("DEBUG: ", local_rank)
+    
+    # breakpoint()
+    # local_rank = 0
+    
     logging.info('Using GPU: %s' % torch.cuda.get_device_name(local_rank))
     torch.cuda.set_device(local_rank)
 
@@ -161,7 +166,7 @@ def main():
     if cfgs.resume_from is not None:
         logging.info('Resuming from %s' % cfgs.resume_from)
         runner.resume(cfgs.resume_from)
-
+        breakpoint()
     elif cfgs.load_from is not None:
         logging.info('Loading checkpoint from %s' % cfgs.load_from)
         if cfgs.revise_keys is not None:
@@ -174,7 +179,7 @@ def main():
                 model, cfgs.load_from, map_location='cpu',
             )
 
-    runner.run([train_loader], [('train', 1)])
+    runner.run([train_loader], [('train', 1)]) # 训练4次，验证1次；
 
 
 if __name__ == '__main__':
